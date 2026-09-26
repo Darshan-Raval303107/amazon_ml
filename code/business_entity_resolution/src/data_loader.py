@@ -5,11 +5,15 @@ Handles reading and writing of TSV files with strict adherence to the competitio
 Guarantees explicit tab separation to prevent comma-splitting corruptions.
 """
 
+import csv
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 
 from .config import PathConfig, SchemaConfig
+
+log = logging.getLogger(__name__)
 
 
 class DataLoader:
@@ -19,7 +23,7 @@ class DataLoader:
         self.paths = path_config or PathConfig()
         self.schemas = schema_config or SchemaConfig()
 
-    def load_source_file(self, file_path: Path) -> pd.DataFrame:
+    def load_source_file(self, file_path: Path, nrows: Optional[int] = None) -> pd.DataFrame:
         """
         Load a source TSV file (source 1, 2, or 3) with explicit tab delimiter.
 
@@ -29,9 +33,19 @@ class DataLoader:
             - business_address (str): address string
             - country (str): country label (US, India, France, etc.)
         """
-        # TODO: Implement chunking/streaming if test/train files exceed available RAM.
-        # TODO: Implement column type enforcement and NaN handling.
-        raise NotImplementedError("TODO: Implement load_source_file in data_loader.py")
+        df = pd.read_csv(
+            str(file_path),
+            sep="\t",
+            dtype=str,
+            nrows=nrows,
+            keep_default_na=False,
+            encoding="utf-8",
+            encoding_errors="replace",
+        )
+        for col in ["entity_id", "business_name", "business_address", "country"]:
+            if col not in df.columns:
+                df[col] = ""
+        return df
 
     def load_ground_truth(self, file_path: Path) -> pd.DataFrame:
         """
@@ -41,23 +55,41 @@ class DataLoader:
             - source1_entity_id (str)
             - matched_entity_ids (str): comma-separated string of matched IDs or empty
         """
-        # TODO: Parse comma-separated matched_entity_ids into Python sets/lists.
-        # TODO: Validate that matched IDs only reference S2- or S3- entities.
-        raise NotImplementedError("TODO: Implement load_ground_truth in data_loader.py")
+        df = pd.read_csv(
+            str(file_path),
+            sep="\t",
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8",
+            encoding_errors="replace",
+        )
+        for col in ["source1_entity_id", "matched_entity_ids"]:
+            if col not in df.columns:
+                df[col] = ""
+        return df
 
-    def load_train_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def load_train_dataset(
+        self, nrows: Optional[int] = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Load all training sources (source 1, source 2, source 3) and ground truth.
         """
-        # TODO: Orchestrate loading of all 4 training files and return typed DataFrames.
-        raise NotImplementedError("TODO: Implement load_train_dataset in data_loader.py")
+        s1 = self.load_source_file(self.paths.train_dir / self.paths.train_s1_file, nrows=nrows)
+        s2 = self.load_source_file(self.paths.train_dir / self.paths.train_s2_file, nrows=nrows)
+        s3 = self.load_source_file(self.paths.train_dir / self.paths.train_s3_file, nrows=nrows)
+        gt = self.load_ground_truth(self.paths.train_dir / self.paths.train_ground_truth_file)
+        return s1, s2, s3, gt
 
-    def load_test_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def load_test_dataset(
+        self, nrows: Optional[int] = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Load test sources (source 1, source 2, source 3).
         """
-        # TODO: Orchestrate loading of test source files.
-        raise NotImplementedError("TODO: Implement load_test_dataset in data_loader.py")
+        s1 = self.load_source_file(self.paths.test_dir / self.paths.test_s1_file, nrows=nrows)
+        s2 = self.load_source_file(self.paths.test_dir / self.paths.test_s2_file, nrows=nrows)
+        s3 = self.load_source_file(self.paths.test_dir / self.paths.test_s3_file, nrows=nrows)
+        return s1, s2, s3
 
     def save_matching_results(self, predictions: Dict[str, List[str]], output_path: Path) -> None:
         """
@@ -69,9 +101,19 @@ class DataLoader:
             - matched_entity_ids: comma-separated list of S2/S3 IDs, or empty for singletons
             - One row per Source 1 entity in the test set
         """
-        # TODO: Validate no duplicates in matched_entity_ids list.
-        # TODO: Ensure all test S1 entities are present and write with sep='\t', index=False.
-        raise NotImplementedError("TODO: Implement save_matching_results in data_loader.py")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(output_path), "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="\t", lineterminator="\n")
+            writer.writerow(["source1_entity_id", "matched_entity_ids"])
+            for s1_id, matches in predictions.items():
+                seen = set()
+                clean = []
+                for m in matches:
+                    clean_id = m.strip()
+                    if clean_id and clean_id not in seen:
+                        seen.add(clean_id)
+                        clean.append(clean_id)
+                writer.writerow([s1_id.strip(), ",".join(clean)])
 
     def save_candidate_pairs(self, candidates: Dict[str, List[str]], output_path: Path) -> None:
         """
@@ -82,5 +124,16 @@ class DataLoader:
             - Header: source1_entity_id\tcandidate_entity_ids
             - candidate_entity_ids: comma-separated list of candidate S2/S3 IDs
         """
-        # TODO: Write candidate pairs TSV compatible with validate_submission.py.
-        raise NotImplementedError("TODO: Implement save_candidate_pairs in data_loader.py")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(output_path), "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="\t", lineterminator="\n")
+            writer.writerow(["source1_entity_id", "candidate_entity_ids"])
+            for s1_id, cands in candidates.items():
+                seen = set()
+                clean = []
+                for c in cands:
+                    clean_id = c.strip()
+                    if clean_id and clean_id not in seen:
+                        seen.add(clean_id)
+                        clean.append(clean_id)
+                writer.writerow([s1_id.strip(), ",".join(clean)])

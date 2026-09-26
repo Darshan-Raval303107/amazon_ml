@@ -81,6 +81,3 @@ class ModelConfig:
     f_beta: float = 0.5
     default_decision_threshold: float = 0.5
 
-
-# TODO: Add dynamic environment variable parsing or YAML/JSON loading if configuration overrides are needed.
-# TODO: Fine-tune candidate generation thresholds and CatBoost hyperparameters during hyperparameter search.

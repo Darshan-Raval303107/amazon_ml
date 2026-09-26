@@ -80,5 +80,20 @@ class Evaluator:
         Returns:
             Tuple of (best_threshold, best_macro_f05_score)
         """
-        # TODO: Implement fast vector search over candidate probabilities to identify optimal F0.5 cutoff.
-        raise NotImplementedError("TODO: Implement find_optimal_threshold in evaluate.py")
+        low, high, steps = threshold_range
+        thresholds = np.linspace(low, high, steps)
+        best_threshold = 0.50
+        best_score = -1.0
+
+        for thresh in thresholds:
+            pred_dict: Dict[str, Set[str]] = {}
+            for s1_id, cands in candidate_probabilities.items():
+                matched = {cand_id for cand_id, prob in cands if prob >= thresh}
+                pred_dict[s1_id] = matched
+
+            score = self.compute_macro_f_score(pred_dict, ground_truth)
+            if score > best_score:
+                best_score = score
+                best_threshold = float(thresh)
+
+        return best_threshold, best_score
