@@ -1,0 +1,20 @@
+Metric,MiniLM,CatBoost,Hybrid
+Optimal Decision Threshold,0.94,0.10,0.10
+Pairwise Precision,0.4054,0.8889,0.8400
+Pairwise Recall,0.3061,0.8163,0.8571
+Macro F0.5 (Competition Metric),0.0585,0.0626,0.0630
+F1 Score,0.3488,0.8511,0.8485
+Accuracy,0.999896,0.999974,0.999972
+ROC-AUC,0.9754,0.9998,0.9984
+PR-AUC,0.2715,0.9155,0.8953
+True Positives (TP),15,40,42
+False Positives (FP),22,5,8
+False Negatives (FN),34,9,7
+True Negatives (TN),537999,538016,538013
+Zero-Match Performance,1.0000,1.0000,1.0000
+Single-Match Performance,0.0048,0.0096,0.0096
+Multi-Match Performance,0.0025,0.0069,0.0073
+Inference Latency per 1k Entities,0.000 s,0.014 s,0.010 s
+Peak Memory Usage,2.6 MB,16.5 MB,16.5 MB
+Model Artifact Size,662.55 MB,0.25 MB,200.51 MB
+Candidate Pairs Evaluated,"538,070","538,070","538,070"
