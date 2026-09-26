@@ -1,0 +1,22 @@
+# Core Dependencies for Business Entity Resolution Solution
+# Note: Do not install yet as per project setup instructions.
+
+# Data Manipulation & Numerical Computing
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Traditional Feature Engineering & String Matching
+rapidfuzz>=3.0.0
+scikit-learn>=1.3.0
+
+# Deep Learning & Multilingual Embeddings
+torch>=2.0.0
+sentence-transformers>=3.0.0
+transformers>=4.40.0
+
+# Gradient Boosted Decision Trees
+catboost>=1.2.0
+
+# Progress Tracking & Utilities
+tqdm>=4.65.0
