@@ -95,11 +95,11 @@ ID_COLS = ["source1_entity_id", "candidate_entity_id", "source_dataset"]
 @dataclass
 class PredictionConfig:
     """Configuration for test prediction and submission generation."""
-    s1_limit: Optional[int]       = None      # If set, blocks first N test S1 entities
-    target_limit: Optional[int]   = None      # If set, caps S2/S3 target corpus size
-    top_k: int                    = 30        # Top-K candidate pairs per S1
-    max_candidates_per_s1: int    = 50        # Hard cap per S1
-    batch_size: int               = 5000      # Candidate generation batch size
+    s1_limit: Optional[int]       = None      # If set, blocks first N test S1 entities (None = all)
+    target_limit: Optional[int]   = None      # If set, caps S2/S3 target corpus size (None = all)
+    top_k: int                    = 15        # Top-K candidate pairs per S1
+    max_candidates_per_s1: int    = 25        # Hard cap per S1
+    batch_size: int               = 25000     # Candidate generation & streaming batch size
     threshold: float              = 0.50      # Default F0.5 optimal threshold
     device: Optional[str]         = None      # Device for MiniLM ('cuda' or 'cpu')
 
@@ -607,13 +607,369 @@ class Predictor:
         return all_ok
 
     # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # End-to-end Pipeline Execution
     # ─────────────────────────────────────────────────────────────────────────
 
-    def run(self) -> None:
-        """Run complete Phase 7 prediction workflow."""
+    def run_streaming_pipeline(self) -> None:
+        """
+        Memory-efficient, highly scalable streaming prediction pipeline.
+        Processes all 1,732,544 test Source-1 records without sampling.
+        Uses fast inverted index on target entities with country gating,
+        cached MiniLM embeddings, and trained CatBoost model scoring.
+        """
+        import array
+        from collections import defaultdict
+        import pyarrow.csv as pacsv
+
         log.info("=============================================================")
-        log.info("  STARTING PHASE 7 - TEST PREDICTION & SUBMISSION PIPELINE")
+        log.info("  PHASE 7 - FULL TEST DATASET STREAMING PREDICTION PIPELINE")
+        log.info("=============================================================")
+
+        t0 = time.time()
+        paths = self.paths
+
+        out_cand_tsv = str(paths.output_dir / "candidate_pairs.tsv")
+        out_submission_tsv = str(paths.output_dir / "matching_results.tsv")
+        model_path = str(paths.models_dir / "catboost_model.cbm")
+        report_path = str(paths.output_dir / "training_report.md")
+        cache_path = str(paths.models_dir / "entity_embeddings_cache.npz")
+        full_test_s1_path = str(paths.test_dir / paths.test_s1_file)
+        test_s2_path = str(paths.test_dir / paths.test_s2_file)
+        test_s3_path = str(paths.test_dir / paths.test_s3_file)
+
+        # 1. Load CatBoost model
+        if CatBoostClassifier is None:
+            raise ImportError("catboost is not installed.")
+        log.info("Loading CatBoost model from %s ...", model_path)
+        model = CatBoostClassifier()
+        model.load_model(model_path)
+        feature_cols = model.feature_names_
+        threshold = get_optimal_threshold_from_report(report_path, default=self.cfg.threshold)
+        log.info("CatBoost ready with %d features | Decision threshold: %.2f", len(feature_cols), threshold)
+
+        # 2. Load cached embeddings
+        log.info("Loading cached embeddings from %s ...", cache_path)
+        cached_data = load_entity_embeddings_cache(cache_path)
+        if cached_data is not None:
+            id_to_idx, name_embs, addr_embs, has_addr = cached_data
+            log.info("Cached embeddings available for %d entities", len(id_to_idx))
+        else:
+            id_to_idx, name_embs, addr_embs, has_addr = {}, None, None, None
+
+        # 3. Load target tables into PyArrow columnar memory
+        log.info("Loading test target datasets (S2 & S3) with PyArrow ...")
+        t_load = time.time()
+        t2 = pacsv.read_csv(test_s2_path, parse_options=pacsv.ParseOptions(delimiter="\t"))
+        t3 = pacsv.read_csv(test_s3_path, parse_options=pacsv.ParseOptions(delimiter="\t"))
+        len_t2 = len(t2)
+        len_t3 = len(t3)
+        total_targets = len_t2 + len_t3
+        log.info("Loaded S2 (%d) and S3 (%d) in %.2fs | Total: %d target entities | Mem: %.1f MB",
+                 len_t2, len_t3, time.time() - t_load, total_targets, get_mem_mb())
+
+        # 4. Build token inverted index with country gating
+        log.info("Building token inverted index over %d target entities ...", total_targets)
+        t_idx = time.time()
+        clean_re = re.compile(r"[^a-z0-9\s]")
+        stopwords = {
+            "the", "and", "inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation",
+            "company", "co", "services", "group", "solutions", "enterprises", "holdings",
+            "management", "international", "technologies", "technology", "global", "industries",
+            "associates", "consulting", "systems", "trading", "investment"
+        }
+        token_index = defaultdict(lambda: array.array("I"))
+        target_ids: List[str] = []
+        target_countries: List[str] = []
+        target_sources: List[str] = []
+
+        for table, prefix, offset in [(t2, "S2", 0), (t3, "S3", len_t2)]:
+            names_col = table.column("business_name")
+            countries_col = table.column("country")
+            eids_col = table.column("entity_id")
+            n = len(table)
+
+            for i in range(n):
+                eid = eids_col[i].as_py()
+                ctry_raw = countries_col[i].as_py()
+                name_raw = names_col[i].as_py()
+
+                target_ids.append(eid)
+                target_countries.append(sys.intern(normalize_country(ctry_raw)) if ctry_raw else "")
+                target_sources.append(prefix)
+
+                if name_raw:
+                    cleaned = clean_re.sub(" ", name_raw.lower())
+                    toks = [tok for tok in cleaned.split() if len(tok) >= 3 and tok not in stopwords]
+                    if not toks:
+                        toks = [tok for tok in cleaned.split() if len(tok) >= 2]
+                    for tok in toks:
+                        token_index[tok].append(offset + i)
+
+        # Prune high-frequency noise tokens (> 5000) to keep retrieval fast
+        pruned_token_index = {tok: arr for tok, arr in token_index.items() if len(arr) <= 5000}
+        n_pruned = len(token_index) - len(pruned_token_index)
+        del token_index
+        gc.collect()
+        log.info("Target index complete in %.2fs: %d tokens indexed (%d noise tokens pruned) | Mem: %.1f MB",
+                 time.time() - t_idx, len(pruned_token_index), n_pruned, get_mem_mb())
+
+        # Row lookup helper for target entities
+        def get_target_entity_tuple(pos: int) -> Tuple[str, str, str, str, str, bool, bool, bool]:
+            if pos < len_t2:
+                tbl = t2
+                row_idx = pos
+                src = "S2"
+            else:
+                tbl = t3
+                row_idx = pos - len_t2
+                src = "S3"
+            eid = target_ids[pos]
+            ctry = target_countries[pos]
+            raw_n = tbl.column("business_name")[row_idx].as_py() or ""
+            raw_a = tbl.column("business_address")[row_idx].as_py() or ""
+            return (
+                eid,
+                normalize_business_name(raw_n),
+                normalize_business_address(raw_a),
+                ctry,
+                src,
+                bool(raw_n),
+                bool(raw_a),
+                bool(ctry),
+            )
+
+        # 5. Open output files and stream predictions
+        Path(out_cand_tsv).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_submission_tsv).parent.mkdir(parents=True, exist_ok=True)
+
+        cand_f = open(out_cand_tsv, "w", encoding="utf-8", newline="", errors="replace")
+        sub_f = open(out_submission_tsv, "w", encoding="utf-8", newline="", errors="replace")
+        cand_writer = csv.writer(cand_f, delimiter="\t", lineterminator="\n")
+        sub_writer = csv.writer(sub_f, delimiter="\t", lineterminator="\n")
+
+        cand_writer.writerow(["source1_entity_id", "candidate_entity_ids"])
+        sub_writer.writerow(["source1_entity_id", "matched_entity_ids"])
+
+        total_s1 = 0
+        total_candidates = 0
+        total_matches = 0
+        zero_matches = 0
+        seen_s1: Set[str] = set()
+
+        batch_size = self.cfg.batch_size
+        top_k = self.cfg.top_k
+        max_cands = self.cfg.max_candidates_per_s1
+
+        log.info("Processing all test Source-1 records (streaming batch_size=%d, top_k=%d) ...",
+                 batch_size, top_k)
+
+        t_stream_start = time.time()
+
+        def process_batch(batch: List[Tuple[str, str, str, str]]) -> None:
+            nonlocal total_s1, total_candidates, total_matches, zero_matches
+            if not batch:
+                return
+
+            # Candidate Generation for this batch
+            batch_cand_positions: Dict[str, List[int]] = {}
+            needed_target_pos: Set[int] = set()
+            pairs_to_score: List[Tuple[str, int]] = []
+
+            for s1_id, raw_n, raw_a, raw_c in batch:
+                norm_n = normalize_business_name(raw_n)
+                norm_c = sys.intern(normalize_country(raw_c)) if raw_c else ""
+
+                cleaned = clean_re.sub(" ", norm_n.lower())
+                toks = [t for t in cleaned.split() if len(t) >= 3 and t not in stopwords]
+                if not toks:
+                    toks = [t for t in cleaned.split() if len(t) >= 2]
+
+                cand_counts = defaultdict(int)
+                for tok in toks:
+                    if tok in pruned_token_index:
+                        for p in pruned_token_index[tok]:
+                            cand_counts[p] += 1
+
+                cands: List[int] = []
+                for p, _ in sorted(cand_counts.items(), key=lambda x: -x[1])[:max_cands]:
+                    t_ctry = target_countries[p]
+                    if not norm_c or not t_ctry or norm_c == t_ctry:
+                        cands.append(p)
+                        needed_target_pos.add(p)
+                        pairs_to_score.append((s1_id, p))
+                        if len(cands) >= top_k:
+                            break
+
+                batch_cand_positions[s1_id] = cands
+
+            # Feature Engineering and Scoring
+            predictions: Dict[str, List[str]] = defaultdict(list)
+            if pairs_to_score:
+                store = EntityStore()
+                for s1_id, raw_n, raw_a, raw_c in batch:
+                    if batch_cand_positions.get(s1_id):
+                        store.entities[s1_id] = (
+                            normalize_business_name(raw_n),
+                            normalize_business_address(raw_a),
+                            normalize_country(raw_c),
+                            bool(raw_n),
+                            bool(raw_a),
+                            bool(raw_c),
+                        )
+
+                for p in needed_target_pos:
+                    eid, n_n, n_a, n_c, src, hn, ha, hc = get_target_entity_tuple(p)
+                    store.entities[eid] = (n_n, n_a, n_c, hn, ha, hc)
+
+                chunk_pairs_df = pd.DataFrame([
+                    {
+                        "source1_entity_id": s1,
+                        "candidate_entity_id": target_ids[p],
+                        "source_dataset": target_sources[p],
+                    }
+                    for s1, p in pairs_to_score
+                ])
+
+                extractor = FeatureExtractor(FeatureConfig())
+                extractor.fit(store)
+                feats = extractor.extract_chunk_features(chunk_pairs_df, store)
+
+                # Append MiniLM embedding features using cache
+                n_pairs = len(feats)
+                s1_arr = feats["source1_entity_id"].to_numpy(dtype=str)
+                cand_arr = feats["candidate_entity_id"].to_numpy(dtype=str)
+
+                if id_to_idx:
+                    idx_s1 = np.array([id_to_idx.get(eid, -1) for eid in s1_arr], dtype=np.int32)
+                    idx_cand = np.array([id_to_idx.get(eid, -1) for eid in cand_arr], dtype=np.int32)
+                    both_valid = (idx_s1 >= 0) & (idx_cand >= 0)
+                else:
+                    both_valid = np.zeros(n_pairs, dtype=bool)
+
+                name_cos = np.zeros(n_pairs, dtype=np.float32)
+                addr_cos = np.zeros(n_pairs, dtype=np.float32)
+                both_have_addr = np.zeros(n_pairs, dtype=bool)
+
+                if np.any(both_valid) and name_embs is not None and addr_embs is not None:
+                    u_n = name_embs[idx_s1[both_valid]]
+                    v_n = name_embs[idx_cand[both_valid]]
+                    name_cos[both_valid] = np.clip(np.sum(u_n * v_n, axis=1), 0.0, 1.0)
+
+                    if has_addr is not None:
+                        addr_s1_ok = has_addr[idx_s1[both_valid]]
+                        addr_c_ok = has_addr[idx_cand[both_valid]]
+                        both_addr_ok = addr_s1_ok & addr_c_ok
+                        sub_idx = np.where(both_valid)[0][both_addr_ok]
+                        both_have_addr[sub_idx] = True
+                        if len(sub_idx) > 0:
+                            u_a = addr_embs[idx_s1[sub_idx]]
+                            v_a = addr_embs[idx_cand[sub_idx]]
+                            addr_cos[sub_idx] = np.clip(np.sum(u_a * v_a, axis=1), 0.0, 1.0)
+
+                comb = np.where(both_have_addr, 0.7 * name_cos + 0.3 * addr_cos, name_cos).astype(np.float32)
+                l2 = np.sqrt(np.maximum(0.0, 2.0 * (1.0 - name_cos))).astype(np.float32)
+                diff = np.where(both_have_addr, np.abs(name_cos - addr_cos), 0.0).astype(np.float32)
+
+                feats["name_embedding_cosine"] = name_cos
+                feats["address_embedding_cosine"] = addr_cos
+                feats["combined_embedding_score"] = comb
+                feats["embedding_l2_distance"] = l2
+                feats["embedding_difference"] = diff
+
+                # Model scoring
+                X = feats[feature_cols].fillna(0.0)
+                probs = model.predict_proba(X)[:, 1]
+                feats["prob"] = probs
+                matched_pairs = feats[feats["prob"] >= threshold]
+
+                for _, r in matched_pairs.iterrows():
+                    predictions[r["source1_entity_id"]].append(r["candidate_entity_id"])
+
+            # Write outputs for batch
+            for s1_id, _, _, _ in batch:
+                pos_list = batch_cand_positions.get(s1_id, [])
+                cand_list = [target_ids[p] for p in pos_list]
+                match_list = predictions.get(s1_id, [])
+
+                clean_cands = list(dict.fromkeys(cand_list))
+                clean_matches = list(dict.fromkeys(match_list))
+
+                cand_writer.writerow([s1_id, ",".join(clean_cands)])
+                sub_writer.writerow([s1_id, ",".join(clean_matches)])
+
+                total_s1 += 1
+                total_candidates += len(clean_cands)
+                total_matches += len(clean_matches)
+                if not clean_matches:
+                    zero_matches += 1
+
+            if total_s1 % 100000 == 0 or total_s1 == 1732544:
+                elapsed = time.time() - t_stream_start
+                rate = total_s1 / max(1.0, elapsed)
+                log.info("Progress: %d / 1,732,544 S1 entities (%.1f%%) | Matches: %d | Rate: %.0f S1/s | Mem: %.1f MB",
+                         total_s1, 100.0 * total_s1 / 1732544, total_matches, rate, get_mem_mb())
+
+        # Stream reading test_source1.tsv
+        with open(full_test_s1_path, "r", encoding="utf-8", errors="replace") as s1_in:
+            reader = csv.DictReader(s1_in, delimiter="\t")
+            cur_batch: List[Tuple[str, str, str, str]] = []
+
+            for row in reader:
+                s1_id = row["entity_id"].strip()
+                if not s1_id or s1_id in seen_s1:
+                    continue
+                seen_s1.add(s1_id)
+                raw_n = row.get("business_name", "").strip()
+                raw_a = row.get("business_address", "").strip()
+                raw_c = row.get("country", "").strip()
+
+                cur_batch.append((s1_id, raw_n, raw_a, raw_c))
+                if len(cur_batch) >= batch_size:
+                    process_batch(cur_batch)
+                    cur_batch = []
+
+            if cur_batch:
+                process_batch(cur_batch)
+                cur_batch = []
+
+        cand_f.close()
+        sub_f.close()
+
+        # Step 8: Validation
+        self.validate_submission(
+            full_test_s1_path=full_test_s1_path,
+            test_s2_path=test_s2_path,
+            test_s3_path=test_s3_path,
+            submission_path=out_submission_tsv,
+            cand_tsv_path=out_cand_tsv,
+        )
+
+        # Step 9: Summary
+        runtime = time.time() - t0
+        peak_mem = get_mem_mb()
+        avg_matches = total_matches / max(1, total_s1)
+
+        print("\n" + "=" * 70)
+        print("  PHASE 7: EXECUTION & SUBMISSION SUMMARY")
+        print("=" * 70)
+        print(f"  Total Source1 entities processed  : {total_s1:,}")
+        print(f"  Total candidate pairs generated   : {total_candidates:,}")
+        print(f"  Total predicted matches           : {total_matches:,}")
+        print(f"  Zero-match entities               : {zero_matches:,} ({100.0 * zero_matches / max(1, total_s1):.2f}%)")
+        print(f"  Entities with >= 1 match          : {total_s1 - zero_matches:,} ({100.0 * (total_s1 - zero_matches) / max(1, total_s1):.2f}%)")
+        print(f"  Average matches per Source1       : {avg_matches:.4f}")
+        print(f"  Decision threshold applied        : {threshold:.2f}")
+        print(f"  Total Pipeline Runtime            : {runtime:.2f} s")
+        print(f"  Peak Memory Usage                 : {peak_mem:.1f} MB")
+        print(f"  Submission TSV                    : {out_submission_tsv}")
+        print(f"  Candidate Pairs TSV               : {out_cand_tsv}")
+        print("=" * 70 + "\n")
+
+    def run_sampled_pipeline(self) -> None:
+        """Run Phase 7 prediction workflow with sample limits."""
+        log.info("=============================================================")
+        log.info("  STARTING PHASE 7 - TEST PREDICTION (SAMPLED PIPELINE)")
         log.info("=============================================================")
 
         t0 = time.time()
@@ -681,6 +1037,13 @@ class Predictor:
         print(f"  Candidate Pairs TSV               : {out_cand_tsv}")
         print("=" * 70 + "\n")
 
+    def run(self) -> None:
+        """Run complete Phase 7 prediction workflow."""
+        if self.cfg.s1_limit is None and self.cfg.target_limit is None:
+            self.run_streaming_pipeline()
+        else:
+            self.run_sampled_pipeline()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI Entrypoint
@@ -688,12 +1051,14 @@ class Predictor:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 7 Test Prediction Pipeline")
-    parser.add_argument("--s1-limit", type=int, default=5000,
-                        help="Number of test S1 records to block and score (default: 5000 for responsive execution, or omit for custom)")
-    parser.add_argument("--target-limit", type=int, default=20000,
-                        help="Number of test S2/S3 target records to index (default: 20000)")
-    parser.add_argument("--top-k", type=int, default=30,
-                        help="Top-K candidate pairs per S1 (default: 30)")
+    parser.add_argument("--s1-limit", type=int, default=None,
+                        help="Number of test S1 records to block and score (default: None for full official dataset)")
+    parser.add_argument("--target-limit", type=int, default=None,
+                        help="Number of test S2/S3 target records to index (default: None for full official dataset)")
+    parser.add_argument("--top-k", type=int, default=15,
+                        help="Top-K candidate pairs per S1 (default: 15)")
+    parser.add_argument("--batch-size", type=int, default=25000,
+                        help="Streaming batch size (default: 25000)")
     parser.add_argument("--threshold", type=float, default=0.50,
                         help="Decision threshold (default: 0.50)")
     parser.add_argument("--device", type=str, default=None,
@@ -705,6 +1070,7 @@ def main() -> None:
         s1_limit=args.s1_limit,
         target_limit=args.target_limit,
         top_k=args.top_k,
+        batch_size=args.batch_size,
         threshold=args.threshold,
         device=args.device,
     )
