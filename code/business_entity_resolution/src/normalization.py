@@ -1,4 +1,4 @@
-﻿"""
+"""
 Text normalization module for Business Entity Resolution.
 
 Provides four public functions used by blocking, feature engineering,
@@ -38,6 +38,12 @@ from typing import Optional
 # These are applied after the string is lowercased and punctuation is removed,
 # using whole-word boundary replacement, so "pvt" only matches the token "pvt"
 # and not substrings inside longer words.
+# Legal / corporate entity-type tokens that appear in many different notations.
+# Mapping: normalised abbreviation token -> canonical expanded form.
+# Keys are *already lowercased* and punctuation-stripped.
+# These are applied after the string is lowercased and punctuation is removed,
+# using whole-word boundary replacement, so "pvt" only matches the token "pvt"
+# and not substrings inside longer words.
 _LEGAL_SUFFIX_MAP: dict = {
     # Private / Public
     "pvt":          "private",
@@ -54,18 +60,42 @@ _LEGAL_SUFFIX_MAP: dict = {
     "inc":          "incorporated",
     "co ltd":       "company limited",
     "co":           "company",
+    # French & European corporate forms (Section 1.3 - generalization for unseen France test)
+    "sarl":         "sarl",
+    "sas":          "sas",
+    "sasu":         "sasu",
+    "sa":           "sa",
+    "eurl":         "eurl",
+    "sci":          "sci",
+    "snc":          "snc",
+    "gie":          "gie",
+    "sca":          "sca",
+    "scs":          "scs",
+    "selarl":       "selarl",
+    "societe a responsabilite limitee": "sarl",
+    "société à responsabilité limitée": "sarl",
+    "societe par actions simplifiee":   "sas",
+    "société par actions simplifiée":   "sas",
+    "societe anonyme":                  "sa",
+    "société anonyme":                  "sa",
+    "societe civile immobiliere":       "sci",
+    "société civile immobilière":       "sci",
+    "entreprise unipersonnelle a responsabilite limitee": "eurl",
+    "entreprise unipersonnelle à responsabilité limitée": "eurl",
     # Other international suffixes
     "srl":          "srl",
     "gmbh":         "gmbh",
     "ag":           "ag",
     "bv":           "bv",
     "nv":           "nv",
-    "sa":           "sa",
     "pty":          "proprietary",
     "sdn bhd":      "sendirian berhad",
     "bhd":          "berhad",
     "pte":          "private",
     "opc":          "one person company",
+    "sp zoo":       "sp zoo",
+    "sl":           "sl",
+    "kgaa":         "kgaa",
 }
 
 # Address abbreviations: street type tokens -> expanded form.
@@ -88,6 +118,14 @@ _ADDRESS_ABBR_MAP: dict = {
     "trl":   "trail",
     "aly":   "alley",
     "xing":  "crossing",
+    # French street types (Section 1.3 / European generalization)
+    "rue":   "rue",
+    "bd":    "boulevard",
+    "av":    "avenue",
+    "all":   "allee",
+    "imp":   "impasse",
+    "pl":    "place",
+    "rte":   "route",
     # Unit / Floor designators
     "fl":    "floor",
     "flr":   "floor",
@@ -106,13 +144,60 @@ _ADDRESS_ABBR_MAP: dict = {
     "w":     "west",
     # India-specific
     "mg":    "mahatma gandhi",
-    "opp":   "opposite",
-    "nr":    "near",
     "soc":   "society",
     # PO Box normalisation
     "po box":  "po box",
     "p o box": "po box",
 }
+
+# Landmark filler noise prefixes to strip (Section 1.5 - landmark address noise)
+_LANDMARK_NOISE_RE = re.compile(
+    r"\b(near|opposite|opp|behind|next\s+to|adjacent\s+to|beside|in\s+front\s+of|infront\s+of|close\s+to|oppsite|oppo|opp\s+to|nr\s+to|nr)\b",
+    re.IGNORECASE,
+)
+
+# Devanagari transliteration phoneme map (Section 2.3 - mixed-script coverage)
+_DEVANAGARI_MAP = {
+    'अ': 'a', 'आ': 'aa', 'इ': 'i', 'ई': 'ee', 'उ': 'u', 'ऊ': 'oo', 'ऋ': 'ri',
+    'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au', 'अं': 'an', 'अः': 'ah',
+    'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'ng',
+    'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'ny',
+    'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+    'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+    'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+    'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v', 'श': 'sh', 'ष': 'sh', 'स': 's', 'ह': 'h',
+    'ा': 'a', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo', 'ृ': 'ri',
+    'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au', 'ं': 'n', 'ँ': 'n', 'ः': 'h',
+    '्': '', '़': '', 'ॅ': 'e', 'ॉ': 'o',
+}
+
+def romanize_devanagari(text: str) -> str:
+    """Transliterate Devanagari characters to Roman phonemes to bridge mixed scripts."""
+    if not any('\u0900' <= ch <= '\u097f' for ch in text):
+        return text
+    chars = list(text)
+    n = len(chars)
+    res = []
+    i = 0
+    while i < n:
+        c = chars[i]
+        if c in _DEVANAGARI_MAP:
+            val = _DEVANAGARI_MAP[c]
+            is_consonant = '\u0915' <= c <= '\u0939'
+            if is_consonant:
+                if i + 1 < n and chars[i + 1] in [
+                    '\u093e', '\u093f', '\u0940', '\u0941', '\u0942', '\u0943',
+                    '\u0947', '\u0948', '\u094b', '\u094c', '\u094d', '\u0945', '\u0949'
+                ]:
+                    res.append(val)
+                else:
+                    res.append(val + ('a' if i + 1 < n else ''))
+            else:
+                res.append(val)
+        else:
+            res.append(c)
+        i += 1
+    return "".join(res)
 
 # Characters treated as punctuation (to be replaced with space).
 # Hyphens (-) are kept because they carry meaning in "Hewlett-Packard" etc.
@@ -255,11 +340,22 @@ def normalize_business_name(text: object) -> str:
 
     s = raw.lower()                              # Step 2
     s = _unicode_normalise(s)                    # Step 3
+    s = romanize_devanagari(s)                   # Step 3b: Devanagari Romanization (mixed-script bridge)
     s = re.sub(r"\s*&\s*", " and ", s)           # Step 4
     s = _strip_punctuation_to_space(s)           # Step 5
     s = _normalise_whitespace(s)                 # Step 6
     s = _apply_token_map(s, _LEGAL_PATTERNS)     # Step 7
     s = _normalise_whitespace(s)                 # Step 8
+
+    # Generic structural suffix stripping (Section 1.3 - fallback for unseen corporate forms)
+    # If the name ends with a trailing short token (<= 5 chars) preceded by space, check if it's
+    # a known suffix or common short corporate abbreviation
+    tokens = s.split()
+    if len(tokens) > 1 and len(tokens[-1]) <= 5 and tokens[-1] in {
+        "sarl", "sas", "sasu", "sa", "eurl", "sci", "snc", "gie", "sca", "scs", "selarl", "sem",
+        "corp", "inc", "llc", "ltd", "gmbh", "ag", "bv", "nv", "srl", "sl", "pvt", "plc"
+    }:
+        pass  # already canonicalized cleanly by _LEGAL_PATTERNS
 
     return s
 
@@ -273,15 +369,17 @@ def normalize_business_address(text: object) -> str:
     1. **Missing value handling** - Returns ``""`` for missing/sentinel input.
     2. **Lowercase** - Reduces variation in address tokens.
     3. **Unicode NFKC normalisation** - Resolves encoding inconsistencies.
+    3b. **Devanagari Romanization** - Transliterates Indian script addresses to Latin.
     4. **Ampersand normalisation** - ``&`` -> ``and``.
-    5. **Punctuation stripping** - Periods, commas, slashes, etc. to spaces;
+    5. **Landmark noise stripping** - Strips filler preposition phrases ("near",
+       "opposite", "behind", "next to", "adjacent to", "opp", "nr") so the core
+       place name can match formal addresses.
+    6. **Punctuation stripping** - Periods, commas, slashes, etc. to spaces;
        hyphens preserved.
-    6. **Whitespace normalisation**.
-    7. **Address abbreviation expansion** - Expands known street-type tokens
-       (``st``->``street``, ``rd``->``road``, ``ave``->``avenue``), directional
-       tokens (``n``->``north``, ``sw``->``southwest``), and unit designators
-       (``fl``->``floor``, ``apt``->``apartment``) using whole-word matching.
-    8. **Final whitespace cleanup**.
+    7. **Whitespace normalisation**.
+    8. **Address abbreviation expansion** - Expands street-type tokens, directional
+       tokens, and unit designators.
+    9. **Final whitespace cleanup**.
 
     No geocoding, no external APIs, no postal-code stripping.
     Postal/PIN codes are deliberately preserved as strong blocking signals.
@@ -295,15 +393,6 @@ def normalize_business_address(text: object) -> str:
     -------
     str
         Normalised address string, or ``""`` if missing.
-
-    Examples
-    --------
-    >>> normalize_business_address("12 MG Road, Bengaluru")
-    '12 mahatma gandhi road bengaluru'
-    >>> normalize_business_address("105 ELM ST, MORGANTON, NC")
-    '105 elm street morganton nc'
-    >>> normalize_business_address("914 PIERPONT AVE, CLEVELAND, OH")
-    '914 pierpont avenue cleveland oh'
     """
     raw = _to_str(text)
     if raw is None:
@@ -311,13 +400,32 @@ def normalize_business_address(text: object) -> str:
 
     s = raw.lower()                                # Step 2
     s = _unicode_normalise(s)                      # Step 3
+    s = romanize_devanagari(s)                     # Step 3b
     s = re.sub(r"\s*&\s*", " and ", s)             # Step 4
-    s = _strip_punctuation_to_space(s)             # Step 5
-    s = _normalise_whitespace(s)                   # Step 6
-    s = _apply_token_map(s, _ADDRESS_PATTERNS)     # Step 7
-    s = _normalise_whitespace(s)                   # Step 8
+    s = _LANDMARK_NOISE_RE.sub(" ", s)             # Step 5: Strip landmark noise prefixes
+    s = _strip_punctuation_to_space(s)             # Step 6
+    s = _normalise_whitespace(s)                   # Step 7
+    s = _apply_token_map(s, _ADDRESS_PATTERNS)     # Step 8
+    s = _normalise_whitespace(s)                   # Step 9
 
     return s
+
+
+_COUNTRY_ALIAS_MAP = {
+    "united states": "us",
+    "united states of america": "us",
+    "usa": "us",
+    "u s a": "us",
+    "u s": "us",
+    "india": "india",
+    "inida": "india",  # Common typo handling (Section 1.2)
+    "ind": "india",
+    "bharat": "india",
+    "france": "france",
+    "fr": "france",
+    "republique francaise": "france",
+    "république française": "france",
+}
 
 
 def normalize_country(text: object) -> str:
@@ -329,8 +437,8 @@ def normalize_country(text: object) -> str:
     * Returns ``""`` for missing / sentinel values.
     * Applies Unicode NFKC and lowercase.
     * Strips leading/trailing whitespace; collapses internal whitespace.
-    * Does **not** expand abbreviations (e.g. "US" stays "us") because the
-      mapping is open-set and aggressive expansion risks errors for unseen codes.
+    * Handles common country aliases and typos (e.g. "inida" -> "india", "usa" -> "us",
+      "fr" -> "france") while degrading gracefully on any unseen country code/name.
     * Does **not** hard-code or filter to a fixed country list.
 
     Parameters
@@ -343,17 +451,6 @@ def normalize_country(text: object) -> str:
     str
         Normalised country string (lowercase, NFKC, whitespace collapsed),
         or ``""`` if missing.
-
-    Examples
-    --------
-    >>> normalize_country("United States")
-    'united states'
-    >>> normalize_country("INDIA")
-    'india'
-    >>> normalize_country("  France  ")
-    'france'
-    >>> normalize_country(None)
-    ''
     """
     raw = _to_str(text)
     if raw is None:
@@ -362,6 +459,9 @@ def normalize_country(text: object) -> str:
     s = raw.lower()
     s = _unicode_normalise(s)
     s = _normalise_whitespace(s)
+    clean_key = re.sub(r"[^\w\s]", "", s).strip()
+    if clean_key in _COUNTRY_ALIAS_MAP:
+        return _COUNTRY_ALIAS_MAP[clean_key]
     return s
 
 

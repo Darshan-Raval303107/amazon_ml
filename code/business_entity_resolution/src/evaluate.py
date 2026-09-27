@@ -97,3 +97,61 @@ class Evaluator:
                 best_threshold = float(thresh)
 
         return best_threshold, best_score
+
+    def find_optimal_source_pair_thresholds(
+        self,
+        candidate_probabilities: Dict[str, List[Tuple[str, float]]],
+        ground_truth: Dict[str, Set[str]],
+        threshold_candidates: List[float] = (0.45, 0.50, 0.55, 0.60, 0.65, 0.70),
+    ) -> Tuple[float, float, float, float]:
+        """
+        Calibrate decision thresholds separately for S1<->S2 and S1<->S3 (Section 3.2).
+
+        Returns:
+            Tuple of (best_s2_threshold, best_s3_threshold, best_score, global_baseline_score)
+        """
+        # Baseline with global 0.50
+        baseline_preds = {
+            s1: {cid for cid, p in cands if p >= 0.50}
+            for s1, cands in candidate_probabilities.items()
+        }
+        baseline_score = self.compute_macro_f_score(baseline_preds, ground_truth)
+
+        best_s2 = 0.50
+        best_s3 = 0.50
+        best_score = baseline_score
+
+        for ts2 in threshold_candidates:
+            for ts3 in threshold_candidates:
+                pred_dict: Dict[str, Set[str]] = {}
+                for s1_id, cands in candidate_probabilities.items():
+                    matched = set()
+                    for cid, p in cands:
+                        if (cid.startswith("S2") and p >= ts2) or (cid.startswith("S3") and p >= ts3):
+                            matched.add(cid)
+                    pred_dict[s1_id] = matched
+
+                score = self.compute_macro_f_score(pred_dict, ground_truth)
+                if score > best_score:
+                    best_score = score
+                    best_s2 = float(ts2)
+                    best_s3 = float(ts3)
+
+        return best_s2, best_s3, best_score, baseline_score
+
+    @staticmethod
+    def evaluate_calibration(
+        y_true: np.ndarray,
+        y_pred_probs: np.ndarray,
+    ) -> Dict[str, float]:
+        """
+        Evaluate probability calibration via Brier score and reliability metrics (Section 3.4).
+        """
+        y_t = np.asarray(y_true, dtype=float)
+        y_p = np.asarray(y_pred_probs, dtype=float)
+        brier_score = float(np.mean((y_p - y_t) ** 2))
+        return {
+            "brier_score": brier_score,
+            "mean_pred_prob": float(np.mean(y_p)),
+            "mean_true_rate": float(np.mean(y_t)),
+        }

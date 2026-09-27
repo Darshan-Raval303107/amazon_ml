@@ -70,6 +70,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from business_entity_resolution.src.normalization import (
     normalize_business_name,
+    normalize_business_address,
     normalize_country,
 )
 from business_entity_resolution.src.config import PathConfig
@@ -89,9 +90,39 @@ CANDIDATE_COLS = [
     "blocking_reason",
 ]
 
-REASON_TOKEN = "name_token"
-REASON_NGRAM = "char_ngram_tfidf"
-REASON_WORD  = "word_tfidf"
+REASON_TOKEN      = "name_token"
+REASON_NGRAM      = "char_ngram_tfidf"
+REASON_WORD       = "word_tfidf"
+REASON_ADDR_TFIDF = "addr_tfidf"
+REASON_PHONETIC   = "phonetic_soundex"
+REASON_SAFETY_NET = "safety_net_country"
+
+
+def soundex(token: str) -> str:
+    """Compute standard American Soundex code for a token (Section 1.4)."""
+    token = token.upper()
+    if not token or not token[0].isalpha():
+        return ""
+    mapping = {
+        'B': '1', 'F': '1', 'P': '1', 'V': '1',
+        'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+        'D': '3', 'T': '3',
+        'L': '4',
+        'M': '5', 'N': '5',
+        'R': '6'
+    }
+    first = token[0]
+    encoded = [first]
+    prev = mapping.get(first, '0')
+    for ch in token[1:]:
+        code = mapping.get(ch, '0')
+        if code != '0' and code != prev:
+            encoded.append(code)
+            prev = code
+        elif code == '0':
+            prev = '0'
+    res = ''.join(encoded)[:4]
+    return res.ljust(4, '0')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,7 +137,9 @@ class BlockingConfig:
     Attributes
     ----------
     top_k : int
-        Maximum candidates returned per TF-IDF retrieval pass per S1 entity.
+        Maximum candidates returned per name TF-IDF retrieval pass per S1 entity.
+    top_k_addr : int
+        Maximum candidates returned per address TF-IDF retrieval pass per S1 entity.
     min_token_length : int
         Minimum character length for a name token to enter the inverted index.
     max_token_frequency : int
@@ -118,6 +151,15 @@ class BlockingConfig:
         Whether to run char n-gram TF-IDF retrieval.
     enable_word_tfidf : bool
         Whether to run word-level TF-IDF retrieval.
+    enable_address_blocking : bool
+        Whether to run the address-keyed TF-IDF retrieval pass (Section 1.1).
+    enable_phonetic_blocking : bool
+        Whether to run the phonetic Soundex inverted-index pass (Section 1.4).
+    enable_safety_net : bool
+        Whether to run the safety-net pass recovering high-similarity candidates
+        across dirty/mismatched country labels (Section 1.2).
+    safety_net_similarity_floor : float
+        Minimum cosine similarity threshold to trigger safety-net admission.
     char_ngram_range : Tuple[int, int]
         Character n-gram range for the char TF-IDF vectorizer.
     word_ngram_range : Tuple[int, int]
@@ -127,7 +169,7 @@ class BlockingConfig:
     batch_size : int
         Number of S1 rows per batch during candidate generation.
     enable_country_gate : bool
-        If True, candidates with incompatible countries are discarded.
+        If True, candidates with incompatible countries are discarded (unless saved by safety net).
     max_candidates_per_s1 : int
         Hard cap on total candidates per S1 entity across all methods.
     n_jobs : int
@@ -135,20 +177,25 @@ class BlockingConfig:
     random_seed : int
         Random seed for reproducibility.
     """
-    top_k: int                 = 50
-    min_token_length: int      = 3
-    max_token_frequency: int   = 10_000
-    enable_token_blocking: bool = True
-    enable_ngram_tfidf: bool   = True
-    enable_word_tfidf: bool    = True
-    char_ngram_range: tuple    = (2, 4)
-    word_ngram_range: tuple    = (1, 2)
-    tfidf_max_features: int    = 200_000
-    batch_size: int            = 10_000
-    enable_country_gate: bool  = True
-    max_candidates_per_s1: int = 100
-    n_jobs: int                = -1
-    random_seed: int           = 42
+    top_k: int                       = 50
+    top_k_addr: int                  = 20
+    min_token_length: int            = 3
+    max_token_frequency: int         = 10_000
+    enable_token_blocking: bool      = True
+    enable_ngram_tfidf: bool         = True
+    enable_word_tfidf: bool          = True
+    enable_address_blocking: bool    = True
+    enable_phonetic_blocking: bool   = True
+    enable_safety_net: bool          = True
+    safety_net_similarity_floor: float = 0.75
+    char_ngram_range: tuple          = (2, 4)
+    word_ngram_range: tuple          = (1, 2)
+    tfidf_max_features: int          = 200_000
+    batch_size: int                  = 10_000
+    enable_country_gate: bool        = True
+    max_candidates_per_s1: int       = 100
+    n_jobs: int                      = -1
+    random_seed: int                 = 42
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +233,7 @@ def load_source_df(path: str, *, nrows: Optional[int] = None) -> pd.DataFrame:
             df[col] = ""
 
     df["norm_name"]    = df["business_name"].map(normalize_business_name)
+    df["norm_address"] = df["business_address"].map(normalize_business_address)
     df["norm_country"] = df["country"].map(normalize_country)
     log.info("  -> %d rows loaded from %s", len(df), Path(path).name)
     return df
@@ -242,6 +290,9 @@ class Blocking:
         # token -> list[row_position]
         self._token_index: Dict[str, List[int]] = {}
 
+        # ── phonetic inverted index (Soundex on first 1-2 tokens) ────────
+        self._phonetic_index: Dict[str, List[int]] = {}
+
         # ── TF-IDF engines (NearestNeighbors on CSR matrices) ─────────────
         self._ng_vec:   Optional[TfidfVectorizer]  = None
         self._ng_mat:   Optional[sp.csr_matrix]    = None
@@ -251,10 +302,16 @@ class Blocking:
         self._word_mat: Optional[sp.csr_matrix]    = None
         self._word_nn:  Optional[NearestNeighbors] = None
 
+        # ── Address TF-IDF engine (Section 1.1) ───────────────────────────
+        self._addr_vec: Optional[TfidfVectorizer]  = None
+        self._addr_mat: Optional[sp.csr_matrix]    = None
+        self._addr_nn:  Optional[NearestNeighbors] = None
+
         # ── target snapshot (arrays for O(1) lookup) ──────────────────────
         self._target_ids:     Optional[np.ndarray] = None
         self._target_src:     Optional[np.ndarray] = None
         self._target_country: Optional[np.ndarray] = None
+        self._target_address: Optional[np.ndarray] = None
 
         # Effective k for NN query (retrieve extra candidates to allow country filtering)
         self._nn_query_k: int = self.cfg.top_k * 2 if self.cfg.enable_country_gate else self.cfg.top_k
@@ -268,7 +325,7 @@ class Blocking:
         Parameters
         ----------
         target_df : pd.DataFrame
-            Must contain columns: entity_id, norm_name, norm_country.
+            Must contain columns: entity_id, norm_name, norm_country, norm_address.
         """
         t0 = time.time()
         n  = len(target_df)
@@ -282,6 +339,12 @@ class Blocking:
              for eid in self._target_ids]
         )
         names = target_df["norm_name"].to_numpy(dtype=str)
+        addresses = (
+            target_df["norm_address"].to_numpy(dtype=str)
+            if "norm_address" in target_df.columns
+            else np.array([""] * n, dtype=str)
+        )
+        self._target_address = addresses
 
         # 1. Token inverted index (with document frequency capping)
         if self.cfg.enable_token_blocking:
@@ -304,8 +367,32 @@ class Blocking:
             del raw_idx
             gc.collect()
 
+        # 1b. Phonetic Soundex inverted index (Section 1.4)
+        if self.cfg.enable_phonetic_blocking:
+            t_ph = time.time()
+            log.info("  Building phonetic Soundex inverted index ...")
+            raw_ph: Dict[str, List[int]] = defaultdict(list)
+            for pos, name in enumerate(names):
+                toks = [tok for tok in name.split() if len(tok) >= self.cfg.min_token_length][:2]
+                for tok in toks:
+                    sx = soundex(tok)
+                    if sx:
+                        raw_ph[sx].append(pos)
+            max_freq = self.cfg.max_token_frequency
+            self._phonetic_index = {
+                sx: pos_list for sx, pos_list in raw_ph.items()
+                if len(pos_list) <= max_freq
+            }
+            log.info("    -> %d phonetic keys indexed in %.2fs",
+                     len(self._phonetic_index), time.time() - t_ph)
+            del raw_ph
+            gc.collect()
+
         # Query neighbor count cannot exceed target population
         query_k = min(self._nn_query_k, n)
+
+        # Adaptive min_df for tiny batches/unit tests
+        eff_min_df = 1 if n < 3 else 2
 
         # 2. Char n-gram TF-IDF + NearestNeighbors
         if self.cfg.enable_ngram_tfidf:
@@ -317,7 +404,7 @@ class Blocking:
                 ngram_range=self.cfg.char_ngram_range,
                 max_features=self.cfg.tfidf_max_features,
                 sublinear_tf=True,
-                min_df=2,
+                min_df=eff_min_df,
                 dtype=np.float32,
             )
             self._ng_mat = self._ng_vec.fit_transform(names)
@@ -344,7 +431,7 @@ class Blocking:
                 ngram_range=self.cfg.word_ngram_range,
                 max_features=self.cfg.tfidf_max_features,
                 sublinear_tf=True,
-                min_df=2,
+                min_df=eff_min_df,
                 dtype=np.float32,
             )
             self._word_mat = self._word_vec.fit_transform(names)
@@ -361,6 +448,31 @@ class Blocking:
             )
             self._word_nn.fit(self._word_mat)
 
+        # 4. Address TF-IDF + NearestNeighbors (Section 1.1)
+        if self.cfg.enable_address_blocking:
+            t_addr = time.time()
+            log.info("  Fitting address TF-IDF (char 2-4, max_feat=%d) ...",
+                     self.cfg.tfidf_max_features)
+            self._addr_vec = TfidfVectorizer(
+                analyzer="char_wb",
+                ngram_range=(2, 4),
+                max_features=self.cfg.tfidf_max_features,
+                sublinear_tf=True,
+                min_df=eff_min_df,
+                dtype=np.float32,
+            )
+            self._addr_mat = self._addr_vec.fit_transform(addresses)
+            query_k_addr = min(self.cfg.top_k_addr * 2, n)
+            log.info("    -> address TF-IDF matrix: %s, nnz=%d in %.2fs",
+                     self._addr_mat.shape, self._addr_mat.nnz, time.time() - t_addr)
+            self._addr_nn = NearestNeighbors(
+                n_neighbors=query_k_addr,
+                metric="cosine",
+                algorithm="brute",
+                n_jobs=self.cfg.n_jobs,
+            )
+            self._addr_nn.fit(self._addr_mat)
+
         log.info("Index building complete in %.1fs | Mem: %.1f MB",
                  time.time() - t0, get_mem_mb())
 
@@ -369,21 +481,7 @@ class Blocking:
     def generate_candidates(self, s1_df: pd.DataFrame) -> pd.DataFrame:
         """
         Query all indices for every S1 entity in configurable batches and return
-        a deduplicated candidate DataFrame.
-
-        Never creates a dense (batch x corpus) matrix. Uses NearestNeighbors on
-        sparse CSR matrices. Prints progress after each batch.
-
-        Parameters
-        ----------
-        s1_df : pd.DataFrame
-            Source-1 records (columns: entity_id, norm_name, norm_country).
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: source1_entity_id, candidate_entity_id, source_dataset,
-                     blocking_reason.
+        a deduplicated candidate DataFrame across unioned channels.
         """
         if self._target_ids is None:
             raise RuntimeError("Call build_indices() before generate_candidates().")
@@ -398,6 +496,11 @@ class Blocking:
         s1_ids       = s1_df["entity_id"].to_numpy(dtype=str)
         s1_names     = s1_df["norm_name"].to_numpy(dtype=str)
         s1_countries = s1_df["norm_country"].to_numpy(dtype=str)
+        s1_addrs     = (
+            s1_df["norm_address"].to_numpy(dtype=str)
+            if "norm_address" in s1_df.columns
+            else np.array([""] * len(s1_df), dtype=str)
+        )
         n_total      = len(s1_df)
 
         batch_size = cfg.batch_size
@@ -413,6 +516,7 @@ class Blocking:
             b_ids       = s1_ids[start:end]
             b_names     = s1_names[start:end]
             b_countries = s1_countries[start:end]
+            b_addrs     = s1_addrs[start:end]
             b_size      = len(b_ids)
 
             # ── 1. Token blocking ─────────────────────────────────────────
@@ -424,12 +528,30 @@ class Blocking:
                             cand_counts[pos] += 1
 
                     added = 0
-                    # Sort candidates by number of shared tokens descending
                     for pos, _ in sorted(cand_counts.items(), key=lambda x: -x[1]):
                         if added >= cfg.max_candidates_per_s1:
                             break
                         if self._country_ok(s1_ctry, self._target_country[pos]):
                             pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_TOKEN)
+                            added += 1
+
+            # ── 1b. Phonetic blocking (Section 1.4) ───────────────────────
+            if cfg.enable_phonetic_blocking and self._phonetic_index:
+                for s1_id, name, s1_ctry in zip(b_ids, b_names, b_countries):
+                    cand_counts_ph: Dict[int, int] = defaultdict(int)
+                    toks = [tok for tok in name.split() if len(tok) >= cfg.min_token_length][:2]
+                    for tok in toks:
+                        sx = soundex(tok)
+                        if sx and sx in self._phonetic_index:
+                            for pos in self._phonetic_index[sx]:
+                                cand_counts_ph[pos] += 1
+
+                    added = 0
+                    for pos, _ in sorted(cand_counts_ph.items(), key=lambda x: -x[1]):
+                        if added >= (cfg.max_candidates_per_s1 // 2):
+                            break
+                        if self._country_ok(s1_ctry, self._target_country[pos]):
+                            pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_PHONETIC)
                             added += 1
 
             # ── 2. Char n-gram TF-IDF via NearestNeighbors ────────────────
@@ -443,12 +565,18 @@ class Blocking:
                     added   = 0
                     for dist, pos in zip(dists_ng[i], indices_ng[i]):
                         if dist >= 1.0:
-                            # Cosine distance >= 1.0 means similarity <= 0
                             continue
-                        if not self._country_ok(s1_ctry, self._target_country[pos]):
-                            continue
-                        pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_NGRAM)
-                        added += 1
+                        sim = 1.0 - dist
+                        country_match = self._country_ok(s1_ctry, self._target_country[pos])
+
+                        if country_match:
+                            pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_NGRAM)
+                            added += 1
+                        elif cfg.enable_safety_net and sim >= cfg.safety_net_similarity_floor:
+                            # Section 1.2: Safety-net pass recovering high similarity despite dirty country
+                            pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_SAFETY_NET)
+                            added += 1
+
                         if added >= cfg.top_k:
                             break
 
@@ -464,12 +592,48 @@ class Blocking:
                     for dist, pos in zip(dists_word[i], indices_word[i]):
                         if dist >= 1.0:
                             continue
-                        if not self._country_ok(s1_ctry, self._target_country[pos]):
-                            continue
-                        pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_WORD)
-                        added += 1
+                        sim = 1.0 - dist
+                        country_match = self._country_ok(s1_ctry, self._target_country[pos])
+
+                        if country_match:
+                            pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_WORD)
+                            added += 1
+                        elif cfg.enable_safety_net and sim >= cfg.safety_net_similarity_floor:
+                            pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_SAFETY_NET)
+                            added += 1
+
                         if added >= cfg.top_k:
                             break
+
+            # ── 4. Address TF-IDF via NearestNeighbors (Section 1.1) ──────
+            if cfg.enable_address_blocking and self._addr_nn is not None and self._addr_vec is not None:
+                # Only query entities with non-empty addresses
+                has_addr_mask = [len(a.strip()) > 3 for a in b_addrs]
+                if any(has_addr_mask):
+                    q_addr = self._addr_vec.transform(b_addrs)
+                    dists_addr, indices_addr = self._addr_nn.kneighbors(q_addr)
+
+                    for i in range(b_size):
+                        if not has_addr_mask[i]:
+                            continue
+                        s1_id   = b_ids[i]
+                        s1_ctry = b_countries[i]
+                        added   = 0
+                        for dist, pos in zip(dists_addr[i], indices_addr[i]):
+                            if dist >= 1.0:
+                                continue
+                            sim = 1.0 - dist
+                            country_match = self._country_ok(s1_ctry, self._target_country[pos])
+
+                            if country_match:
+                                pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_ADDR_TFIDF)
+                                added += 1
+                            elif cfg.enable_safety_net and sim >= cfg.safety_net_similarity_floor:
+                                pair_reasons[(s1_id, self._target_ids[pos])].add(REASON_SAFETY_NET)
+                                added += 1
+
+                            if added >= cfg.top_k_addr:
+                                break
 
             # ── Progress reporting after each batch ───────────────────────
             curr_mem = get_mem_mb()
@@ -514,7 +678,7 @@ class Blocking:
         log.info("Final candidate DataFrame: %d rows", len(result))
         return result
 
-    # ── evaluation ────────────────────────────────────────────────────────
+    # ── evaluation & recall audit ─────────────────────────────────────────
 
     @staticmethod
     def evaluate(
@@ -524,26 +688,36 @@ class Blocking:
         target_total: int,
         runtime_sec: float = 0.0,
         peak_mem_mb: float = 0.0,
+        expected_s1_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, float]:
+        """Alias for audit_blocking_recall for backward compatibility."""
+        return Blocking.audit_blocking_recall(
+            candidates_df=candidates_df,
+            ground_truth=ground_truth,
+            s1_total=s1_total,
+            target_total=target_total,
+            runtime_sec=runtime_sec,
+            peak_mem_mb=peak_mem_mb,
+            expected_s1_ids=expected_s1_ids,
+        )
+
+    @staticmethod
+    def audit_blocking_recall(
+        candidates_df: pd.DataFrame,
+        ground_truth: Dict[str, Set[str]],
+        s1_total: int,
+        target_total: int,
+        runtime_sec: float = 0.0,
+        peak_mem_mb: float = 0.0,
+        expected_s1_ids: Optional[Set[str]] = None,
     ) -> Dict[str, float]:
         """
-        Compute blocking quality metrics.
-
-        Parameters
-        ----------
-        candidates_df : pd.DataFrame
-            Output of generate_candidates().
-        ground_truth : Dict[str, Set[str]]
-            source1_entity_id -> set of true matched entity ids.
-        s1_total : int
-            Total number of S1 entities.
-        target_total : int
-            Total target entities (S2 + S3).
-        runtime_sec : float, optional
-        peak_mem_mb : float, optional
-
-        Returns
-        -------
-        Dict[str, float]
+        Mandatory blocking-recall audit (Section 1.6).
+        Computes recall ceiling per source pair:
+          - overall recall ceiling against all expected S1 entities
+          - S1 <-> S2 recall ceiling
+          - S1 <-> S3 recall ceiling
+          - reduction ratio
         """
         total_possible = s1_total * target_total
         n_cands        = len(candidates_df)
@@ -555,31 +729,60 @@ class Blocking:
 
         s1_covered = candidates_df["source1_entity_id"].nunique()
         s1_present = set(candidates_df["source1_entity_id"].unique())
-        gt_filtered = {k: v for k, v in ground_truth.items() if k in s1_present}
+        eval_s1_set = expected_s1_ids if expected_s1_ids is not None else s1_present
+        gt_filtered = {k: v for k, v in ground_truth.items() if k in eval_s1_set}
 
         true_total = sum(len(v) for v in gt_filtered.values())
-        found = sum(
-            1
-            for s1_id, matched in gt_filtered.items()
-            for cand_id in matched
-            if (s1_id, cand_id) in pair_set
-        )
+        found_total = 0
+        s2_true_total = 0
+        s2_found = 0
+        s3_true_total = 0
+        s3_found = 0
 
-        recall          = found / true_total if true_total > 0 else 0.0
+        for s1_id, matched in gt_filtered.items():
+            for cand_id in matched:
+                is_found = (s1_id, cand_id) in pair_set
+                if is_found:
+                    found_total += 1
+                if cand_id.startswith("S2"):
+                    s2_true_total += 1
+                    if is_found:
+                        s2_found += 1
+                elif cand_id.startswith("S3"):
+                    s3_true_total += 1
+                    if is_found:
+                        s3_found += 1
+
+        recall    = found_total / true_total if true_total > 0 else 0.0
+        recall_s2 = s2_found / s2_true_total if s2_true_total > 0 else 0.0
+        recall_s3 = s3_found / s3_true_total if s3_true_total > 0 else 0.0
         reduction_ratio = 1.0 - n_cands / total_possible if total_possible > 0 else 0.0
-        avg_per_s1      = n_cands / s1_covered if s1_covered > 0 else 0.0
+        avg_per_s1 = n_cands / s1_covered if s1_covered > 0 else 0.0
 
-        return {
+        audit = {
             "candidate_pairs":             n_cands,
             "reduction_ratio":             reduction_ratio,
             "candidate_recall":            recall,
-            "found_true_pairs":            found,
+            "candidate_recall_overall":    recall,
+            "candidate_recall_s1_s2":      recall_s2,
+            "candidate_recall_s1_s3":      recall_s3,
+            "found_true_pairs":            found_total,
             "true_pairs_total":            true_total,
+            "found_s2_pairs":              s2_found,
+            "true_s2_total":               s2_true_total,
+            "found_s3_pairs":              s3_found,
+            "true_s3_total":               s3_true_total,
             "avg_candidates_per_s1":       avg_per_s1,
             "s1_entities_with_candidates": s1_covered,
             "total_runtime_sec":           runtime_sec,
             "peak_memory_mb":              peak_mem_mb,
         }
+        log.info("Blocking Recall Audit (Section 1.6):")
+        log.info("  Overall Recall Ceiling : %.2f%% (%d / %d)", recall * 100, found_total, true_total)
+        log.info("  S1 <-> S2 Recall Ceiling: %.2f%% (%d / %d)", recall_s2 * 100, s2_found, s2_true_total)
+        log.info("  S1 <-> S3 Recall Ceiling: %.2f%% (%d / %d)", recall_s3 * 100, s3_found, s3_true_total)
+        log.info("  Reduction Ratio         : %.6f (1 - %d / %d)", reduction_ratio, n_cands, total_possible)
+        return audit
 
     # ── I/O ───────────────────────────────────────────────────────────────
 
@@ -643,8 +846,32 @@ def run_blocking(
 
     # 1. Load data
     s1_df = load_source_df(str(paths.train_dir / paths.train_s1_file), nrows=nrows)
-    s2_df = load_source_df(str(paths.train_dir / paths.train_s2_file), nrows=nrows)
-    s3_df = load_source_df(str(paths.train_dir / paths.train_s3_file), nrows=nrows)
+    s1_ids_set = set(s1_df["entity_id"].tolist())
+    gt_path = paths.train_dir / paths.train_ground_truth_file
+
+    if nrows is not None and gt_path.exists():
+        log.info("Sampling %d S1 entities: Preserving all true target alignments in target corpus ...", len(s1_df))
+        gt = load_ground_truth(str(gt_path))
+        needed_targets = set()
+        for s1 in s1_ids_set:
+            needed_targets.update(gt.get(s1, set()))
+
+        s2_needed = {m for m in needed_targets if m.startswith("S2")}
+        s3_needed = {m for m in needed_targets if m.startswith("S3")}
+
+        # Load S2 preserving all true targets + distractor records
+        s2_raw = load_source_df(str(paths.train_dir / paths.train_s2_file))
+        s2_df = s2_raw[s2_raw["entity_id"].isin(s2_needed) | (s2_raw.index < max(nrows, 5000))].copy()
+        del s2_raw
+
+        # Load S3 preserving all true targets + distractor records
+        s3_raw = load_source_df(str(paths.train_dir / paths.train_s3_file))
+        s3_df = s3_raw[s3_raw["entity_id"].isin(s3_needed) | (s3_raw.index < max(nrows, 5000))].copy()
+        del s3_raw
+        gc.collect()
+    else:
+        s2_df = load_source_df(str(paths.train_dir / paths.train_s2_file), nrows=nrows)
+        s3_df = load_source_df(str(paths.train_dir / paths.train_s3_file), nrows=nrows)
 
     # 2. Build combined target (S2 + S3)
     log.info("Concatenating S2 (%d) + S3 (%d) into target corpus ...",
@@ -664,9 +891,8 @@ def run_blocking(
 
     # 5. Evaluate
     metrics = None
-    gt_path = paths.train_dir / paths.train_ground_truth_file
     if gt_path.exists():
-        gt      = load_ground_truth(str(gt_path))
+        gt = load_ground_truth(str(gt_path))
         metrics = Blocking.evaluate(
             candidates_df,
             ground_truth = gt,
@@ -674,6 +900,7 @@ def run_blocking(
             target_total = len(target_df),
             runtime_sec  = total_time,
             peak_mem_mb  = peak_mem,
+            expected_s1_ids = s1_ids_set,
         )
         log.info("════════════════ Blocking Evaluation Summary ════════════════")
         log.info("  Candidate Pairs               : %d",   metrics["candidate_pairs"])

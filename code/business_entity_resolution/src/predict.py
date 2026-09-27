@@ -64,6 +64,11 @@ from business_entity_resolution.src.blocking import (
     Blocking,
     BlockingConfig,
     load_source_df,
+    soundex,
+)
+from business_entity_resolution.src.assignment import (
+    ConflictResolver,
+    AssignmentConfig,
 )
 from business_entity_resolution.src.features import (
     EntityStore,
@@ -98,9 +103,14 @@ class PredictionConfig:
     s1_limit: Optional[int]       = None      # If set, blocks first N test S1 entities (None = all)
     target_limit: Optional[int]   = None      # If set, caps S2/S3 target corpus size (None = all)
     top_k: int                    = 15        # Top-K candidate pairs per S1
+    top_k_addr: int               = 10        # Address candidate channel top-k (Section 1.1)
     max_candidates_per_s1: int    = 25        # Hard cap per S1
     batch_size: int               = 25000     # Candidate generation & streaming batch size
     threshold: float              = 0.50      # Default F0.5 optimal threshold
+    threshold_s2: float           = 0.50      # S1 <-> S2 calibrated threshold (Section 3.2)
+    threshold_s3: float           = 0.50      # S1 <-> S3 calibrated threshold (Section 3.2)
+    singleton_floor: float        = 0.50      # Singleton guard floor (Section 3.3)
+    enable_conflict_resolution: bool = True   # Global bipartite conflict resolution (Section 3.1)
     device: Optional[str]         = None      # Device for MiniLM ('cuda' or 'cpu')
 
 
@@ -668,8 +678,8 @@ class Predictor:
         log.info("Loaded S2 (%d) and S3 (%d) in %.2fs | Total: %d target entities | Mem: %.1f MB",
                  len_t2, len_t3, time.time() - t_load, total_targets, get_mem_mb())
 
-        # 4. Build token inverted index with country gating
-        log.info("Building token inverted index over %d target entities ...", total_targets)
+        # 4. Build multi-channel inverted indices: Token, Phonetic, Address (Sections 1.1, 1.4)
+        log.info("Building multi-channel inverted indices over %d target entities ...", total_targets)
         t_idx = time.time()
         clean_re = re.compile(r"[^a-z0-9\s]")
         stopwords = {
@@ -679,12 +689,15 @@ class Predictor:
             "associates", "consulting", "systems", "trading", "investment"
         }
         token_index = defaultdict(lambda: array.array("I"))
+        phonetic_index = defaultdict(lambda: array.array("I"))
+        addr_index = defaultdict(lambda: array.array("I"))
         target_ids: List[str] = []
         target_countries: List[str] = []
         target_sources: List[str] = []
 
         for table, prefix, offset in [(t2, "S2", 0), (t3, "S3", len_t2)]:
             names_col = table.column("business_name")
+            addrs_col = table.column("business_address")
             countries_col = table.column("country")
             eids_col = table.column("entity_id")
             n = len(table)
@@ -693,26 +706,43 @@ class Predictor:
                 eid = eids_col[i].as_py()
                 ctry_raw = countries_col[i].as_py()
                 name_raw = names_col[i].as_py()
+                addr_raw = addrs_col[i].as_py()
 
                 target_ids.append(eid)
                 target_countries.append(sys.intern(normalize_country(ctry_raw)) if ctry_raw else "")
                 target_sources.append(prefix)
 
+                # Channel 1: Token blocking
                 if name_raw:
-                    cleaned = clean_re.sub(" ", name_raw.lower())
-                    toks = [tok for tok in cleaned.split() if len(tok) >= 3 and tok not in stopwords]
+                    cleaned_n = clean_re.sub(" ", name_raw.lower())
+                    toks = [tok for tok in cleaned_n.split() if len(tok) >= 3 and tok not in stopwords]
                     if not toks:
-                        toks = [tok for tok in cleaned.split() if len(tok) >= 2]
+                        toks = [tok for tok in cleaned_n.split() if len(tok) >= 2]
                     for tok in toks:
                         token_index[tok].append(offset + i)
 
-        # Prune high-frequency noise tokens (> 5000) to keep retrieval fast
+                    # Channel 2: Phonetic Soundex (Section 1.4)
+                    for tok in toks[:2]:
+                        sx = soundex(tok)
+                        if sx:
+                            phonetic_index[sx].append(offset + i)
+
+                # Channel 3: Address-keyed blocking (Section 1.1)
+                if addr_raw:
+                    cleaned_a = clean_re.sub(" ", addr_raw.lower())
+                    a_toks = [t for t in cleaned_a.split() if len(t) >= 3 and t not in stopwords]
+                    for t in a_toks:
+                        addr_index[t].append(offset + i)
+
+        # Prune high-frequency noise tokens (> 5000) to keep retrieval sub-second and bound RAM
         pruned_token_index = {tok: arr for tok, arr in token_index.items() if len(arr) <= 5000}
-        n_pruned = len(token_index) - len(pruned_token_index)
-        del token_index
+        pruned_phonetic_index = {sx: arr for sx, arr in phonetic_index.items() if len(arr) <= 5000}
+        pruned_addr_index = {tok: arr for tok, arr in addr_index.items() if len(arr) <= 5000}
+        del token_index, phonetic_index, addr_index
         gc.collect()
-        log.info("Target index complete in %.2fs: %d tokens indexed (%d noise tokens pruned) | Mem: %.1f MB",
-                 time.time() - t_idx, len(pruned_token_index), n_pruned, get_mem_mb())
+
+        log.info("Multi-channel indices ready in %.2fs: %d name tokens, %d phonetic keys, %d addr tokens | Mem: %.1f MB",
+                 time.time() - t_idx, len(pruned_token_index), len(pruned_phonetic_index), len(pruned_addr_index), get_mem_mb())
 
         # Row lookup helper for target entities
         def get_target_entity_tuple(pos: int) -> Tuple[str, str, str, str, str, bool, bool, bool]:
@@ -757,44 +787,71 @@ class Predictor:
         zero_matches = 0
         seen_s1: Set[str] = set()
 
+        # Global conflict resolution tracking (Section 3.1)
+        # Guarantees each candidate S2/S3 entity is assigned to at most ONE S1 entity across the test set
+        claimed_targets: Set[str] = set()
+        global_conflicts_resolved = 0
+
         batch_size = self.cfg.batch_size
         top_k = self.cfg.top_k
         max_cands = self.cfg.max_candidates_per_s1
 
-        log.info("Processing all test Source-1 records (streaming batch_size=%d, top_k=%d) ...",
-                 batch_size, top_k)
+        log.info("Processing all test Source-1 records (batch_size=%d, top_k=%d, conflict_resolution=%s) ...",
+                 batch_size, top_k, self.cfg.enable_conflict_resolution)
 
         t_stream_start = time.time()
 
         def process_batch(batch: List[Tuple[str, str, str, str]]) -> None:
-            nonlocal total_s1, total_candidates, total_matches, zero_matches
+            nonlocal total_s1, total_candidates, total_matches, zero_matches, global_conflicts_resolved
             if not batch:
                 return
 
-            # Candidate Generation for this batch
+            # Multi-channel Candidate Generation for this batch
             batch_cand_positions: Dict[str, List[int]] = {}
             needed_target_pos: Set[int] = set()
             pairs_to_score: List[Tuple[str, int]] = []
 
             for s1_id, raw_n, raw_a, raw_c in batch:
                 norm_n = normalize_business_name(raw_n)
+                norm_a = normalize_business_address(raw_a)
                 norm_c = sys.intern(normalize_country(raw_c)) if raw_c else ""
 
-                cleaned = clean_re.sub(" ", norm_n.lower())
-                toks = [t for t in cleaned.split() if len(t) >= 3 and t not in stopwords]
+                cleaned_n = clean_re.sub(" ", norm_n.lower())
+                toks = [t for t in cleaned_n.split() if len(t) >= 3 and t not in stopwords]
                 if not toks:
-                    toks = [t for t in cleaned.split() if len(t) >= 2]
+                    toks = [t for t in cleaned_n.split() if len(t) >= 2]
 
                 cand_counts = defaultdict(int)
+
+                # Channel 1: Name token hits (weight +2)
                 for tok in toks:
                     if tok in pruned_token_index:
                         for p in pruned_token_index[tok]:
+                            cand_counts[p] += 2
+
+                # Channel 2: Phonetic hits (weight +1)
+                for tok in toks[:2]:
+                    sx = soundex(tok)
+                    if sx and sx in pruned_phonetic_index:
+                        for p in pruned_phonetic_index[sx]:
                             cand_counts[p] += 1
 
+                # Channel 3: Address token hits (weight +1) (Section 1.1)
+                if norm_a:
+                    cleaned_a = clean_re.sub(" ", norm_a.lower())
+                    a_toks = [t for t in cleaned_a.split() if len(t) >= 3 and t not in stopwords]
+                    for t in a_toks:
+                        if t in pruned_addr_index:
+                            for p in pruned_addr_index[t]:
+                                cand_counts[p] += 1
+
+                # Channel 4: Safety-net pass across country mismatches (Section 1.2)
                 cands: List[int] = []
-                for p, _ in sorted(cand_counts.items(), key=lambda x: -x[1])[:max_cands]:
+                for p, score in sorted(cand_counts.items(), key=lambda x: -x[1])[:max_cands]:
                     t_ctry = target_countries[p]
-                    if not norm_c or not t_ctry or norm_c == t_ctry:
+                    country_match = (not norm_c or not t_ctry or norm_c == t_ctry)
+                    # Accept if country matches, or if overlap score is high (safety net)
+                    if country_match or score >= 4:
                         cands.append(p)
                         needed_target_pos.add(p)
                         pairs_to_score.append((s1_id, p))
@@ -881,10 +938,33 @@ class Predictor:
                 X = feats[feature_cols].fillna(0.0)
                 probs = model.predict_proba(X)[:, 1]
                 feats["prob"] = probs
-                matched_pairs = feats[feats["prob"] >= threshold]
 
-                for _, r in matched_pairs.iterrows():
-                    predictions[r["source1_entity_id"]].append(r["candidate_entity_id"])
+                # Apply Per-Source Calibration & Singleton Guard (Sections 3.2 & 3.3)
+                t_s2 = self.cfg.threshold_s2
+                t_s3 = self.cfg.threshold_s3
+                singleton_floor = self.cfg.singleton_floor
+
+                s1_max_prob = feats.groupby("source1_entity_id")["prob"].max().to_dict()
+
+                s2_pass = (feats["source_dataset"] == "S2") & (feats["prob"] >= t_s2)
+                s3_pass = (feats["source_dataset"] == "S3") & (feats["prob"] >= t_s3)
+                passing_pairs = feats[s2_pass | s3_pass].copy()
+
+                # Greedy highest-confidence bipartite conflict resolution (Section 3.1)
+                sorted_passing = passing_pairs.sort_values(by=["prob"], ascending=False)
+                for _, r in sorted_passing.iterrows():
+                    s1 = r["source1_entity_id"]
+                    cand = r["candidate_entity_id"]
+                    # Singleton guard check
+                    if s1_max_prob.get(s1, 0.0) < singleton_floor:
+                        continue
+                    # Conflict check: ensure candidate record is not double-claimed
+                    if self.cfg.enable_conflict_resolution:
+                        if cand in claimed_targets:
+                            global_conflicts_resolved += 1
+                            continue
+                        claimed_targets.add(cand)
+                    predictions[s1].append(cand)
 
             # Write outputs for batch
             for s1_id, _, _, _ in batch:
@@ -894,6 +974,11 @@ class Predictor:
 
                 clean_cands = list(dict.fromkeys(cand_list))
                 clean_matches = list(dict.fromkeys(match_list))
+
+                # Hard Constraint 3: candidate_pairs.tsv must be strict superset of matching_results.tsv
+                for m in clean_matches:
+                    if m not in clean_cands:
+                        clean_cands.append(m)
 
                 cand_writer.writerow([s1_id, ",".join(clean_cands)])
                 sub_writer.writerow([s1_id, ",".join(clean_matches)])
@@ -907,8 +992,8 @@ class Predictor:
             if total_s1 % 100000 == 0 or total_s1 == 1732544:
                 elapsed = time.time() - t_stream_start
                 rate = total_s1 / max(1.0, elapsed)
-                log.info("Progress: %d / 1,732,544 S1 entities (%.1f%%) | Matches: %d | Rate: %.0f S1/s | Mem: %.1f MB",
-                         total_s1, 100.0 * total_s1 / 1732544, total_matches, rate, get_mem_mb())
+                log.info("Progress: %d / 1,732,544 S1 entities (%.1f%%) | Matches: %d | Conflicts Resolved: %d | Rate: %.0f S1/s | Mem: %.1f MB",
+                         total_s1, 100.0 * total_s1 / 1732544, total_matches, global_conflicts_resolved, rate, get_mem_mb())
 
         # Stream reading test_source1.tsv
         with open(full_test_s1_path, "r", encoding="utf-8", errors="replace") as s1_in:

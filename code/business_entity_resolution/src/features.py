@@ -60,6 +60,7 @@ Usage:
 import gc
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -453,14 +454,14 @@ class FeatureExtractor:
                 elif a1 == a2:
                     f_addr_char_ng[i] = 1.0
 
-            # ── Structural: shared numeric tokens & abbreviations ────────
-            all_toks1 = (n1.split() + a1.split())
-            all_toks2 = (n2.split() + a2.split())
-
-            nums1 = {tok for tok in all_toks1 if any(ch.isdigit() for ch in tok)}
-            nums2 = {tok for tok in all_toks2 if any(ch.isdigit() for ch in tok)}
+            # ── Structural: format-agnostic shared numeric tokens (Section 2.4) & abbreviations
+            # Extract any digit sequence of length >= 2 without assuming 5-digit US or 6-digit PIN format
+            nums1 = set(re.findall(r"\d{2,}", n1 + " " + a1))
+            nums2 = set(re.findall(r"\d{2,}", n2 + " " + a2))
             f_shared_nums[i] = len(nums1 & nums2)
 
+            all_toks1 = (n1.split() + a1.split())
+            all_toks2 = (n2.split() + a2.split())
             set_all1 = set(all_toks1)
             set_all2 = set(all_toks2)
             f_shared_abbrs[i] = len(COMMON_ABBREVIATIONS & set_all1 & set_all2)
@@ -535,6 +536,16 @@ class FeatureExtractor:
             "shared_numeric_tokens":      f_shared_nums,
             "shared_abbreviations":       f_shared_abbrs,
         })
+
+        # F. Candidate Set Meta-Features (Sections 2.1 & 2.2)
+        s1_series = pd.Series(s1_ids)
+        cand_series = pd.Series(cand_ids)
+        out["s1_candidate_count"] = s1_series.map(s1_series.value_counts()).to_numpy(dtype=np.float32)
+        out["target_fan_in_count"] = cand_series.map(cand_series.value_counts()).to_numpy(dtype=np.float32)
+
+        is_high_conf = ((f_name_lev >= 0.70) | (f_name_char3g >= 0.70)).astype(np.float32)
+        hc_df = pd.DataFrame({"s1": s1_ids, "hc": is_high_conf})
+        out["s1_high_conf_candidate_count"] = hc_df.groupby("s1")["hc"].transform("sum").to_numpy(dtype=np.float32)
 
         return out
 

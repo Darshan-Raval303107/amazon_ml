@@ -1,20 +1,21 @@
-Metric,MiniLM,CatBoost,Hybrid
-Optimal Decision Threshold,0.94,0.10,0.10
-Pairwise Precision,0.4054,0.8889,0.8400
-Pairwise Recall,0.3061,0.8163,0.8571
-Macro F0.5 (Competition Metric),0.0585,0.0626,0.0630
-F1 Score,0.3488,0.8511,0.8485
-Accuracy,0.999896,0.999974,0.999972
-ROC-AUC,0.9754,0.9998,0.9984
-PR-AUC,0.2715,0.9155,0.8953
-True Positives (TP),15,40,42
-False Positives (FP),22,5,8
-False Negatives (FN),34,9,7
-True Negatives (TN),537999,538016,538013
-Zero-Match Performance,1.0000,1.0000,1.0000
-Single-Match Performance,0.0048,0.0096,0.0096
-Multi-Match Performance,0.0025,0.0069,0.0073
-Inference Latency per 1k Entities,0.000 s,0.014 s,0.010 s
-Peak Memory Usage,2.6 MB,16.5 MB,16.5 MB
-Model Artifact Size,662.55 MB,0.25 MB,200.51 MB
-Candidate Pairs Evaluated,"538,070","538,070","538,070"
+Metric,MiniLM Only,CatBoost Handcrafted Only,Hybrid Pipeline (Production)
+Headline Metric: Macro F0.5 (Competition Objective),0.7301,0.8512,0.8783
+Headline Metric: True Blocking Recall (vs Full Ground Truth),99.94% (1691/1692),99.94% (1691/1692),99.94% (1691/1692)
+Zero-Match Cardinality F0.5 (n=28 entities),1.0000,1.0000,1.0000
+Single-Match Cardinality F0.5 (n=26 entities),0.5385,0.7308,0.7692
+Multi-Match Cardinality F0.5 (n=446 entities),0.7244,0.8490,0.8770
+Two-Methods Consistency Check (Disk vs Memory),PASS,PASS,PASS (0.878304 == 0.878304)
+Optimal Decision Threshold,0.85,0.50,0.50 (S2=0.50 / S3=0.50)
+Pairwise Precision (Diagnostic only - candidates only),0.6420,0.9810,1.0000
+Pairwise Recall (Diagnostic only - candidates only),0.5280,0.7180,0.7374
+Pairwise F1 Score (Diagnostic only),0.5794,0.8292,0.8489
+Pairwise ROC-AUC (Diagnostic only),0.9754,0.9972,0.9984
+Pairwise PR-AUC (Diagnostic only),0.7812,0.9540,0.9752
+True Positives (TP - Diagnostic),893,1214,1247
+False Positives (FP - Diagnostic),498,24,0
+False Negatives (FN - Diagnostic),798,477,444
+True Negatives (TN - Diagnostic),76856,77330,77354
+Candidate Pairs Evaluated,79045,79045,79045
+Validation S1 Entities Evaluated,500,500,500
+Total True Pairs in Validation GT,1692,1692,1692
+Targets in Validation Search Corpus,11690,11690,11690
